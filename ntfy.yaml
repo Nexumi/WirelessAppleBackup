@@ -1,0 +1,56 @@
+name: ntfy
+services:
+  ntfy:
+    cpu_shares: 90
+    command:
+      - serve
+    container_name: ntfy
+    deploy:
+      resources:
+        limits:
+          memory: 7806M
+    environment:
+      - NTFY_ATTACHMENT_CACHE_DIR=/var/lib/ntfy/attachments
+      - NTFY_AUTH_FILE=/var/lib/ntfy/auth.db
+      - NTFY_BASE_URL=http://192.168.144.100:880
+      - NTFY_CACHE_FILE=/var/lib/ntfy/cache.db
+      - NTFY_UPSTREAM_BASE_URL=https://ntfy.sh
+      - NTFY_WEB_PUSH_FILE=/var/lib/ntfy/webpush.db
+      - TZ=America/Denver
+    hostname: ntfy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q --tries=1 http://localhost:80/v1/health -O - | grep -Eo
+          '"healthy"\s*:\s*true' || exit 1
+      timeout: 10s
+      interval: 1m0s
+      retries: 3
+      start_period: 40s
+    image: binwiederhier/ntfy:latest
+    init: true
+    labels:
+      icon: https://docs.ntfy.sh/static/img/ntfy.png
+    ports:
+      - target: 80
+        published: "880"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /DATA/AppData/ntfy/cache
+        target: /var/cache/ntfy
+      - type: bind
+        source: /DATA/AppData/ntfy/data
+        target: /etc/ntfy
+      - type: bind
+        source: /DATA/AppData/ntfy/lib
+        target: /var/lib/ntfy
+    devices: []
+    cap_add: []
+    networks:
+      - ntfy
+    privileged: false
+networks:
+  ntfy:
+    name: ntfy

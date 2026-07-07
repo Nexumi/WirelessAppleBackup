@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# Define target paths relative to the current working directory
+BIN_DIR="./bin"
+LIBS_DIR="./libs"
+RAW_LIBS_DIR="./libs_raw"
+
+# Create fresh, clean directories locally
+mkdir -p "$BIN_DIR"
+mkdir -p "$LIBS_DIR"
+mkdir -p "$RAW_LIBS_DIR"
+
+echo "📦 Creating temporary container from usbmuxd2-builder..."
+CONTAINER_ID=$(sudo docker create usbmuxd2-builder)
+
+if [ -z "$CONTAINER_ID" ]; then
+    echo "❌ Error: Failed to create docker container from image 'usbmuxd2-builder'."
+    exit 1
+fi
+
+echo "🚀 Extracting compiled binaries..."
+# Grab the direct IP daemon executable directly out of the internal build path
+sudo docker cp "$CONTAINER_ID:/app/src/usbmuxd2/usbmuxd2/usbmuxd" "$BIN_DIR/usbmuxd2"
+sudo docker cp "$CONTAINER_ID:/usr/local/bin/idevice_id" "$BIN_DIR/"
+sudo docker cp "$CONTAINER_ID:/usr/local/bin/idevicepair" "$BIN_DIR/"
+sudo docker cp "$CONTAINER_ID:/usr/local/bin/idevicebackup2" "$BIN_DIR/"
+sudo docker cp "$CONTAINER_ID:/usr/local/bin/ideviceinfo" "$BIN_DIR/"
+
+echo "📚 Extracting compiled libraries..."
+sudo docker cp "$CONTAINER_ID:/usr/local/lib/." "$RAW_LIBS_DIR/"
+
+echo "🧹 Cleaning up Docker container instance..."
+sudo docker rm "$CONTAINER_ID" > /dev/null
+
+echo "🔧 Flattening and optimizing shared libraries..."
+find "$RAW_LIBS_DIR" -name "*.so*" -type f -exec cp {} "$LIBS_DIR/" \;
+
+# Use sudo here to fix the "Operation not permitted" error on root-owned docker files
+sudo chmod +x "$BIN_DIR"/*
+
+# Save current directory to jump back to later
+START_DIR=$(pwd)
+
+# Automatically build the standard Linux dynamic library symlinks locally inside ./libs
+cd "$LIBS_DIR" || exit 1
+for lib in *.so.*.*; do
+    if [ -f "$lib" ]; then
+        ln -sf "$lib" "${lib%.*.*}"
+        ln -sf "$lib" "${lib%.*.*.*}"
+    fi
+done
+
+# Return to the original directory
+cd "$START_DIR" || exit 1
+
+# Clean up raw source clutter securely
+sudo rm -rf "$RAW_LIBS_DIR"
+
+echo "--------------------------------------------------------"
+echo "✅ Extraction Complete!"
+echo "📂 Binaries directory: $BIN_DIR"
+echo "📂 Libraries directory: $LIBS_DIR"
+echo "--------------------------------------------------------"
+ls -l "$BIN_DIR"

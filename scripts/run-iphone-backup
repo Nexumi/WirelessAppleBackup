@@ -1,0 +1,57 @@
+#!/bin/bash
+
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/lib/usbmuxd2"
+
+DRY_RUN=false
+UDID=""
+TOPIC=""
+CUSTOM_DIR_NAME=""
+PRIORITY=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--udid) UDID="$2"; shift 2 ;;
+        -d|--dir) CUSTOM_DIR_NAME="$2"; shift 2 ;;
+        -t|--topic) TOPIC="$2"; shift 2 ;;
+        -p|--priority) PRIORITY="$2"; shift 2 ;;
+        -n|--dry-run) DRY_RUN=true; shift 1 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [ -z "$UDID" ]; then
+    echo "Error: --udid [UDID] is required." >&2
+    exit 1
+fi
+
+FOLDER_NAME="${CUSTOM_DIR_NAME:-$UDID}"
+BACKUP_DIR="/mnt/data-pool/backup/APPLE/$FOLDER_NAME"
+
+if [ "$DRY_RUN" = true ]; then
+    echo "--- DRY RUN TEST ACTIVE ---"
+    echo "UDID:              $UDID"
+    echo "Target Folder:     $FOLDER_NAME"
+    echo "Storage Path:      $BACKUP_DIR"
+    if [ "$PRIORITY" == "0" ]; then
+        echo "Notification:      Disabled via priority 0 flag."
+    else
+        echo "Notification:      ${TOPIC:-Disabled} (Priority: $PRIORITY)"
+    fi
+    echo "---------------------------"
+    exit 0
+else
+    mkdir -p "$BACKUP_DIR"
+    SCREEN_NAME="backup-$UDID"
+    # echo "Initializing background worker session: $SCREEN_NAME"
+
+    screen -dmS "$SCREEN_NAME" bash -c "/usr/local/libexec/iphone-backup-helper \
+        -u '$UDID' \
+        -b '$BACKUP_DIR' \
+        -t '$TOPIC' \
+        -d '$FOLDER_NAME' \
+        -p '$PRIORITY'"
+
+    # echo "Success: Backup job handed off to screen session '$SCREEN_NAME'."
+    exit 0
+fi

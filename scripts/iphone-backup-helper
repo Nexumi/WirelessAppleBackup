@@ -1,0 +1,202 @@
+#!/bin/bash
+
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/lib/usbmuxd2"
+
+NTFY_SERVER="http://IP:PORT"
+LOG_DIR="/var/log/idevicebackup2"
+
+# Check if the directory does NOT exist
+if [ ! -d "$LOG_DIR" ]; then
+    # 1. Create the directory structure using sudo
+    sudo mkdir -p "$LOG_DIR"
+    
+    # 2. Change ownership to the current user and their primary group
+    sudo chown "$(id -un):$(id -gn)" "$LOG_DIR"
+    
+    # 3. Adjust permissions (e.g., 755 allows user read/write/execute, others read/execute)
+    # sudo chmod 755 "$LOG_DIR"
+fi
+
+UDID=""
+BACKUP_DIR=""
+TOPIC=""
+FOLDER_NAME=""
+PRIORITY_CONFIG=""
+
+# Parse incoming flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--udid) UDID="$2"; shift 2 ;;
+        -b|--backup-dir) BACKUP_DIR="$2"; shift 2 ;;
+        -t|--topic) TOPIC="$2"; shift 2 ;;
+        -d|--dir-name) FOLDER_NAME="$2"; shift 2 ;;
+        -p|--priority) PRIORITY_CONFIG="$2"; shift 2 ;;
+        *) echo "Worker encountered an unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [ -z "$UDID" ] || [ -z "$BACKUP_DIR" ] || [ -z "$FOLDER_NAME" ]; then
+    echo "Error: Missing required configuration flags." >&2
+    exit 1
+fi
+
+# --- Dynamic Multiline Parsing Logic ---
+START_MODE=0
+SUCCESS_MODE=1
+FAIL_MODE=2
+
+while IFS='=' read -r key value; do
+    value=$(echo "$value" | tr -d '\r')
+    case "$key" in
+        "SEND_START")   START_MODE="$value" ;;
+        "SEND_SUCCESS") SUCCESS_MODE="$value" ;;
+        "SEND_FAIL")    FAIL_MODE="$value" ;;
+    esac
+done <<< "$PRIORITY_CONFIG"
+
+map_ntfy_priority() {
+    case "$1" in
+        1) echo "low" ;;
+        2) echo "default" ;;
+        *) echo "disabled" ;;
+    esac
+}
+
+START_PRIORITY=$(map_ntfy_priority "$START_MODE")
+SUCCESS_PRIORITY=$(map_ntfy_priority "$SUCCESS_MODE")
+FAIL_PRIORITY=$(map_ntfy_priority "$FAIL_MODE")
+# --------------------------------------------
+
+wait_for_device_handshake() {
+    echo "Starting custom handshake polling sequence..." | tee -a "$RUN_LOG"
+    for i in {1..10}; do
+        echo "Pinging device over network..." | tee -a "$RUN_LOG"
+        ideviceinfo --network --udid "$UDID" >/dev/null 2>&1
+
+        # Check if the previous connection attempt succeeded
+        if [ $? -eq 0 ]; then
+            echo "Device responded! Network link verified." | tee -a "$RUN_LOG"
+            return 0
+        fi
+
+        # If we failed and haven't hit the limit yet, pause for 1 seconds before the next ping
+        if [ $i -lt 10 ]; then
+            sleep 1
+        fi
+    done
+    echo "Warning: Handshake verification timed out after 10 attempts." | tee -a "$RUN_LOG"
+    return 1
+}
+
+# 1. Fire "Started" Alert
+if [ -n "$TOPIC" ] && [ "$START_PRIORITY" != "disabled" ]; then
+    curl -H "Title: iPhone Backup Started" \
+         -H "Priority: $START_PRIORITY" \
+         -H "Tags: rocket,iphone" \
+         -d "Sync process has kicked off for $FOLDER_NAME.
+$(date +'[%m/%d/%y - %I:%M:%S %p]')" "$NTFY_SERVER/$TOPIC"
+fi
+
+sleep 1
+
+# --- Integrated Retry Execution Block ---
+MAX_RETRIES=3
+RETRY_COUNT=0
+BACKUP_SUCCESS=false
+
+# We'll use a clean, timestamped file name for this specific backup run
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+RUN_LOG="$LOG_DIR/backup_${FOLDER_NAME// /_}_$TIMESTAMP.log"
+TEMP_LOG="/tmp/last_run_${UDID}.log"
+
+while true; do
+    echo "Starting backup execution... (Structural failures encountered: $RETRY_COUNT/$MAX_RETRIES)" | tee -a "$RUN_LOG"
+
+    # Run backup and overwrite the temporary log file with ONLY this attempt's output
+    idevicebackup2 --network --udid "$UDID" backup "$BACKUP_DIR" 2>&1 | tee "$TEMP_LOG"
+    BACKUP_EXIT_CODE=${PIPESTATUS[0]}
+
+    # Append the fresh attempt output to our persistent log file
+    cat "$TEMP_LOG" >> "$RUN_LOG"
+
+    if [ $BACKUP_EXIT_CODE -eq 0 ]; then
+        BACKUP_SUCCESS=true
+        break
+    fi
+
+    # Parse failure reason out of the FRESH temporary log from just this run
+    if grep -q "Backup Aborted." "$TEMP_LOG"; then
+        echo "Detected 'Backup Aborted.' Progress made. Resetting retry count and handling recovery..." | tee -a "$RUN_LOG"
+
+        # Reset consecutive failures to 0 because progress was made before the network snap
+        RETRY_COUNT=0
+        echo "Triggering retry..." | tee -a "$RUN_LOG"
+    else
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        echo "Backup failed due to an alternate/structural issue. Incrementing retry limit ($RETRY_COUNT/$MAX_RETRIES)..." | tee -a "$RUN_LOG"
+
+        # Check if we have hit the consecutive ceiling
+        if [ $RETRY_COUNT -gt $MAX_RETRIES ]; then
+            echo "Maximum structural retry limit reached. Halting execution loop." | tee -a "$RUN_LOG"
+            break
+        fi
+    fi
+
+    # Global Poke: Executes after ANY failure variant before restarting the loop
+    if [ -n "$TOPIC" ]; then
+        curl -H "Title: Wake up iPhone" \
+             -H "Priority: default" \
+             -H "Tags: alarm_clock,iphone" \
+             -d "Poking connection to resume backup for $FOLDER_NAME.
+$(date +'[%m/%d/%y - %I:%M:%S %p]')" "$NTFY_SERVER/$TOPIC"
+fi
+
+    wait_for_device_handshake
+done
+
+# Clean up our temporary execution log
+rm -f "$TEMP_LOG"
+
+# --- Housekeeping & Final Status Actions ---
+
+# Automated Log and History Cleanup Routine
+cleanup_old_logs() {
+    echo "Running automated log maintenance..." | tee -a "$RUN_LOG"
+    # Deletes any logs in the log directory older than 7 days (-mtime +6)
+    find "$LOG_DIR" -name "*.log" -type f -mtime +6 -delete
+}
+
+if [ "$BACKUP_SUCCESS" = true ]; then
+    # 2. Fire "Success" Alert
+    if [ -n "$TOPIC" ] && [ "$SUCCESS_PRIORITY" != "disabled" ]; then
+        curl -H "Title: iPhone Backup Complete" \
+             -H "Priority: $SUCCESS_PRIORITY" \
+             -H "Tags: white_check_mark,iphone" \
+             -d "Backup for $FOLDER_NAME finished successfully.
+$(date +'[%m/%d/%y - %I:%M:%S %p]')" "$NTFY_SERVER/$TOPIC"
+    fi
+
+    # Clean up after ourselves: delete the log file because the run was 100% successful
+    rm -f "$RUN_LOG"
+
+    cleanup_old_logs
+    exit 0
+else
+    # 3. Fire "Failed" Alert
+    if [ -n "$TOPIC" ] && [ "$FAIL_PRIORITY" != "disabled" ]; then
+        if [ "$FAIL_PRIORITY" == "default" ]; then FAIL_PRIORITY="high"; fi
+
+        curl -H "Title: iPhone Backup FAILED" \
+             -H "Priority: $FAIL_PRIORITY" \
+             -H "Tags: x,iphone" \
+             -d "Backup failed for $FOLDER_NAME.
+$(date +'[%m/%d/%y - %I:%M:%S %p]')" "$NTFY_SERVER/$TOPIC"
+    fi
+
+    # Notice: We intentionally do NOT delete $RUN_LOG here so you can review it later!
+    echo "Execution failed. Retaining debug trace at: $RUN_LOG" | tee -a "$RUN_LOG"
+
+    cleanup_old_logs
+    exit 1
+fi
